@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-SPIRAL — compact terminal audio visualizer with diagonal-moving checker and neon beat stars
+SPIRAL — compact, faster terminal audio visualizer with side speakers driven by volume
 Requires: pip install numpy librosa pygame
 Controls: SPACE Play/Pause | R Reset | Q Quit
 """
@@ -20,7 +20,6 @@ try:
 except Exception:
     print("Missing packages. Install: pip install numpy librosa pygame"); sys.exit(1)
 
-# Optional tkinter prompt
 try:
     import tkinter as tk
     from tkinter import filedialog
@@ -28,18 +27,25 @@ try:
 except Exception:
     TK_AVAILABLE = False
 
-# Colors
+# --- resource-aware exe parent helper (replacement requested)
+def exe_parent_dir():
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            return Path(meipass)
+        return Path(sys.executable).resolve().parent
+    try:
+        return Path(__file__).resolve().parent
+    except:
+        return Path.cwd()
+
+# --- tiny helpers & palette
 def ansi_dim(c): return f"\x1b[2;38;5;{c}m"
 RESET = "\x1b[0m"
 PURPLE = [ansi_dim(c) for c in (129,135,141,147,141)]
 GREEN  = [ansi_dim(c) for c in (22,28,34,40,46)]
 COLOR_SPEED = 0.45
 SUPPORTED = (".mp3", ".wav", ".ogg", ".flac")
-
-def exe_parent_dir():
-    if getattr(sys, "frozen", False): return Path(sys.executable).resolve().parent
-    try: return Path(__file__).resolve().parent
-    except: return Path.cwd()
 
 def choose_and_copy(sub="input_audio"):
     base = exe_parent_dir(); folder = base / sub; created_folder = False
@@ -55,8 +61,8 @@ def choose_and_copy(sub="input_audio"):
             if p: chosen = Path(p)
         except: chosen = None
     if chosen is None:
-        entry = input(f"Audio path (Enter to cancel). Supported: {SUPPORTED}\n> ").strip()
-        if entry: chosen = Path(entry)
+        e = input(f"Audio path (Enter to cancel). Supported: {SUPPORTED}\n> ").strip()
+        if e: chosen = Path(e)
     if not chosen or not chosen.exists() or chosen.suffix.lower() not in SUPPORTED:
         return None, [], created_folder
     dest = folder / chosen.name
@@ -65,6 +71,7 @@ def choose_and_copy(sub="input_audio"):
     except Exception as ex: print("Copy failed:", ex); return None, [], created_folder
     return dest, [dest], created_folder
 
+# --- Display + keyboard (small, efficient)
 class Display:
     def __init__(self):
         tw, th = shutil.get_terminal_size(); self.term_width, self.term_height = tw, th
@@ -74,8 +81,9 @@ class Display:
         self.canvas = [" " * self.width for _ in range(self.height)]
         self.hide, self.show, self.clear = "\33[?25l", "\33[?25h", "\33[2J\33[H"
         print(self.hide + self.clear, end="", flush=True)
-        line = PURPLE[0] + "=" * self.term_width + RESET
-        print(line); print(GREEN[2] + "SPIRAL".center(self.term_width) + RESET); print(line)
+        print(PURPLE[0] + "=" * self.term_width + RESET)
+        print(GREEN[2] + "SPIRAL".center(self.term_width) + RESET)
+        print(PURPLE[0] + "=" * self.term_width + RESET)
         print(GREEN[1] + "Status: Ready | Controls: SPACE=Play R=Reset Q=Quit" + RESET + "\n", flush=True)
     def goto(self,x,y): return f"\33[{y+6};{x+2}H"
     def _colorize(self,row,mask,base):
@@ -121,6 +129,7 @@ class Kbd:
             try: termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old)
             except: pass
 
+# --- Visualizer (compact, efficient)
 class Visualizer:
     GRAD = [" ",".",":","-","=","+","*","█","▓","█"]
     SPECTRUM = ["░","▒","▓","█"]
@@ -131,89 +140,92 @@ class Visualizer:
         self.prev_levels=None; self.smooth_alpha=0.55
         self.pulse_timer=0.0; self.pulse_duration=0.28
         self.star_lives={}; self.star_fade_frames=max(1,int(self.pulse_duration*30)); self.star_glyphs=["✦","*","."]
+        # speaker state (driven by audio overall level)
+        self.speaker_scale = 0.0
+        self.speaker_target = 0.0
+        self.speaker_smooth = 0.22
+        self.speaker_level_multiplier = 2.6
+        self.speaker_decay = 0.06
+        self.speaker_thickness = 2
+        self.speaker_glyph = "●"
     def blank(self): return [list(" "*self.w) for _ in range(self.h)], [list("0"*self.w) for _ in range(self.h)]
     def _set(self, rows,x,y,ch):
         if 0<=x<self.w and 0<=y<self.h: rows[y][x]=ch
     def _set_spec(self, rows,mask,x,y,ch):
         if 0<=x<self.w and 0<=y<self.h: rows[y][x]=ch; mask[y][x]="1"
-
     def _iter_region(self,cx,cy,r,fn):
-        r_i=int(r)
-        for yy in range(cy-r_i, cy+r_i+1):
+        r_i=int(math.ceil(r)); y0=max(0,cy-r_i); y1=min(self.h-1,cy+r_i)
+        x0=max(0, cx-r_i); x1=min(self.w-1,cx+r_i)
+        for yy in range(y0,y1+1):
             yd=yy-cy
-            for xx in range(cx-r_i, cx+r_i+1):
+            for xx in range(x0,x1+1):
                 xd=xx-cx; dist=math.hypot(xd,yd)
                 if dist<=r: fn(xx,yy,xd,yd,dist)
-
     def _mandala(self,rows,cx,cy,scale,levels):
-        gl=len(self.GRAD)-1
-        bass=float(np.mean(levels[:max(1,len(levels)//6)])) if len(levels) else 0.2
-        spokes=max(6,int(6+bass*18)); rings=max(3,int(3+bass*8))
-        hi=levels[len(levels)//2] if len(levels)>1 else 0.2
-        def draw(xx,yy,xd,yd,dist):
-            a=math.atan2(yd,xd)
-            v=0.5*(math.cos(dist*(rings*0.6)) + 0.5*math.cos(a*(spokes/2)))
-            v *= (0.7 + 0.6*hi)
-            idx=int((v+1.0)/2.0*gl)
-            self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
-        self._iter_region(cx,cy,scale,draw)
-
+        gl=len(self.GRAD)-1; bass=float(np.mean(levels[:max(1,len(levels)//6)])) if len(levels) else 0.2
+        spokes=max(6,int(6+bass*18)); rings=max(3,int(3+bass*8)); hi=levels[len(levels)//2] if len(levels)>1 else 0.2
+        def d(xx,yy,xd,yd,dist):
+            a=math.atan2(yd,xd); v=0.5*(math.cos(dist*(rings*0.6))+0.5*math.cos(a*(spokes/2))); v*=(0.7+0.6*hi)
+            idx=int((v+1.0)/2.0*gl); self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
+        self._iter_region(cx,cy,scale,d)
     def _spiral(self,rows,cx,cy,scale,levels):
-        gl=len(self.GRAD)-1
-        mid=float(np.mean(levels[len(levels)//4:len(levels)//2])) if len(levels)>4 else 0.2
+        gl=len(self.GRAD)-1; mid=float(np.mean(levels[len(levels)//4:len(levels)//2])) if len(levels)>4 else 0.2
         turns=2+int(4*mid); freq=3+int(6*mid)
-        def draw(xx,yy,xd,yd,dist):
-            theta=math.atan2(yd,xd)
-            s=math.sin(theta*turns + dist*0.6*freq)
-            v=(s+math.cos(dist*0.8))*(0.6+0.6*mid)
-            idx=int((v+1.0)/2.0*gl)
-            self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
-        self._iter_region(cx,cy,scale,draw)
-
+        def d(xx,yy,xd,yd,dist):
+            theta=math.atan2(yd,xd); s=math.sin(theta*turns + dist*0.6*freq)
+            v=(s+math.cos(dist*0.8))*(0.6+0.6*mid); idx=int((v+1.0)/2.0*gl); self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
+        self._iter_region(cx,cy,scale,d)
     def _checker(self,rows,cx,cy,scale,levels):
         bass=float(levels[0]) if len(levels)>0 else 0.0
         cell=max(2,int(max(2,scale//6)+int(bass*6))); alt=len(levels)>2 and levels[2]>0.4
         half=int(scale); phase=self.frame*0.12; freq=0.12
-        def draw(xx,yy,xd,yd,dist):
+        def d(xx,yy,xd,yd,dist):
             sx=((xx+half)//cell)&1; sy=((yy+half)//cell)&1; base=sx^sy
             diag=xd+yd; m=1 if math.sin(diag*freq + phase)>0 else 0
-            c=base^m; ch="#" if c else "."
+            c=base^m; ch="#" if c else "."; 
             if alt and ((xx+yy)%(cell*2)==0): ch="*"
             self._set(rows,xx,yy,ch)
-        self._iter_region(cx,cy,scale,draw)
-
+        self._iter_region(cx,cy,scale,d)
     def _rings(self,rows,cx,cy,scale,levels):
-        gl=len(self.GRAD)-1
-        low=float(np.mean(levels[:max(1,len(levels)//6)])) if len(levels) else 0.2
+        gl=len(self.GRAD)-1; low=float(np.mean(levels[:max(1,len(levels)//6)])) if len(levels) else 0.2
         rings=4+int(8*low)
-        def draw(xx,yy,xd,yd,dist):
-            v=math.sin(dist*(rings*0.9)-self.frame*0.08)
-            idx=int((v+1.0)/2.0*gl)
-            self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
-        self._iter_region(cx,cy,scale,draw)
-
+        def d(xx,yy,xd,yd,dist):
+            v=math.sin(dist*(rings*0.9)-self.frame*0.08); idx=int((v+1.0)/2.0*gl); self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
+        self._iter_region(cx,cy,scale,d)
     def _waves(self,rows,cx,cy,scale,levels):
-        gl=len(self.GRAD)-1
-        mid=float(np.mean(levels[len(levels)//3:len(levels)//3*2])) if len(levels)>3 else 0.3
+        gl=len(self.GRAD)-1; mid=float(np.mean(levels[len(levels)//3:len(levels)//3*2])) if len(levels)>3 else 0.3
         freq=0.08+mid*0.25; phase=self.frame*0.12
-        def draw(xx,yy,xd,yd,dist):
-            v=math.sin(xd*freq + math.cos(yd*freq*0.8) + phase)
-            idx=int((v+1.0)/2.0*gl)
-            self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
-        self._iter_region(cx,cy,scale,draw)
-
+        def d(xx,yy,xd,yd,dist):
+            v=math.sin(xd*freq + math.cos(yd*freq*0.8) + phase); idx=int((v+1.0)/2.0*gl); self._set(rows,xx,yy,self.GRAD[max(0,min(gl,idx))])
+        self._iter_region(cx,cy,scale,d)
+    def _draw_speakers(self, rows, mask):
+        base_rx = max(8, int(self.w * 0.12)); base_ry = max(8, int(self.h * 0.33))
+        s = max(0.0, 1.0 + self.speaker_scale); rx = max(3, int(base_rx * s)); ry = max(3, int(base_ry * s))
+        cy = int(self.h * 0.5); left_cx = - (rx // 2); right_cx = self.w - 1 + (rx // 2)
+        glyph = self.speaker_glyph; thickness = max(1, int(self.speaker_thickness))
+        def draw_half(cx, side):
+            x0 = max(0, cx - rx); x1 = min(self.w - 1, cx + rx); y0 = max(0, cy - ry); y1 = min(self.h - 1, cy + ry)
+            cutoff = -0.02 if side=="left" else 0.02
+            inner_rx = max(1, rx - thickness); inner_ry = max(1, ry - thickness)
+            for yy in range(y0, y1+1):
+                for xx in range(x0, x1+1):
+                    nx = (xx - cx) / float(rx); ny = (yy - cy) / float(ry)
+                    v = nx*nx + ny*ny
+                    if v <= 1.0 and ((side=="left" and nx>cutoff) or (side=="right" and nx< -cutoff)):
+                        ix = (xx - cx) / float(inner_rx); iy = (yy - cy) / float(inner_ry)
+                        if ix*ix + iy*iy >= 1.0:
+                            rows[yy][xx] = glyph; mask[yy][xx] = "1"
+        draw_half(left_cx,"left"); draw_half(right_cx,"right")
     def draw_pattern(self,rows,mask,levels):
-        name=self.SHAPES[self.shape_idx]
-        base_scale=max(6,min(int(self.h*0.42),int(self.w*0.18))); gap=int(base_scale*2.8)
+        name=self.SHAPES[self.shape_idx]; base_scale=max(6,min(int(self.h*0.42),int(self.w*0.18))); gap=int(base_scale*2.8)
         offs=[0] if self.w<gap*2 else ([-gap,0,gap] if self.w>=gap*3 else [-gap//2,gap//2])
         for off in offs:
-            cx=self.cx+off; cy=self.cy; scale=base_scale
-            if name=="mandala": self._mandala(rows,cx,cy,scale,levels)
-            elif name=="spiral": self._spiral(rows,cx,cy,scale,levels)
-            elif name=="checker": self._checker(rows,cx,cy,scale,levels)
-            elif name=="rings": self._rings(rows,cx,cy,scale,levels)
-            else: self._waves(rows,cx,cy,scale,levels)
-
+            cx=self.cx+off; scale=base_scale
+            if name=="mandala": self._mandala(rows,cx,self.cy,scale,levels)
+            elif name=="spiral": self._spiral(rows,cx,self.cy,scale,levels)
+            elif name=="checker": self._checker(rows,cx,self.cy,scale,levels)
+            elif name=="rings": self._rings(rows,cx,self.cy,scale,levels)
+            else: self._waves(rows,cx,self.cy,scale,levels)
     def add_spectrum(self,rows,mask,levels,bar_slots=None):
         if bar_slots is None: bar_slots=min(self.w-6,len(levels))
         if bar_slots<=0: return
@@ -226,32 +238,27 @@ class Visualizer:
         for i,v in enumerate(mapped):
             bar_h=int(v*maxh); x=base_x+i
             for j in range(bar_h):
-                y=self.h-2-j
-                ch=chars[min(j*clen//max(1,maxh),clen-1)]
-                self._set_spec(rows,mask,x,y,ch)
-
+                y=self.h-2-j; ch=chars[min(j*clen//max(1,maxh),clen-1)]; self._set_spec(rows,mask,x,y,ch)
     def _add_star_at(self,x,y):
         if 0<=x<self.w and 0<=y<self.h and (x,y) not in self.star_lives:
             self.star_lives[(x,y)]=self.star_fade_frames; return True
         return False
-
     def _decay_stars(self):
         if not self.star_lives: return
-        to_del=[]
+        tod=[] 
         for k in list(self.star_lives):
             self.star_lives[k]-=1
-            if self.star_lives[k]<=0: to_del.append(k)
-        for k in to_del: del self.star_lives[k]
-
+            if self.star_lives[k]<=0: tod.append(k)
+        for k in tod: del self.star_lives[k]
     def _draw_stars(self,rows,mask):
         for (x,y),life in list(self.star_lives.items()):
             if 0<=x<self.w and 0<=y<self.h and rows[y][x]==" ":
                 frac=life/float(max(1,self.star_fade_frames))
                 g=self.star_glyphs[0] if frac>0.66 else (self.star_glyphs[1] if frac>0.33 else self.star_glyphs[2])
                 rows[y][x]=g; mask[y][x]="1"
-
     def generate(self,levels):
         rows,mask=self.blank()
+        self._draw_speakers(rows,mask)
         self.draw_pattern(rows,mask,levels)
         self.add_spectrum(rows,mask,levels,bar_slots=min(self.w-6,len(levels)))
         self._draw_stars(rows,mask)
@@ -260,18 +267,21 @@ class Visualizer:
         if self.cool>0: self.cool-=1
         self._decay_stars()
         if self.pulse_timer>0: self.pulse_timer=max(0.0,self.pulse_timer-(1.0/30.0))
+        if self.speaker_scale > self.speaker_target: self.speaker_scale = max(self.speaker_target, self.speaker_scale - self.speaker_decay)
+        else: self.speaker_scale = self.speaker_target
         self.frame+=1
         return ["".join(r)[:self.w] for r in rows], ["".join(m)[:self.w] for m in mask]
 
+# --- Audio (compact, robust)
 class Audio:
     LOW_BAND_ATTENUATION=1.0
     def __init__(self,path):
         self.path=path; self.sr=22050; self.data=None; self.duration=0.0; self.t=0.0; self.playing=False; self.start=0.0
-        self._band_cache={}
-        self._energy_mean=0.0; self._energy_alpha=0.08
+        self._band_cache={}; self._energy_mean=0.0; self._energy_alpha=0.08
         self._last_pulse_time=0.0; self._pulse_cooldown=0.25; self._sensitivity=1.6; self._pending_pulse=False
         self._low_energy=0.0; self._sustain_spawn_interval=0.22; self._last_sustain_spawn=0.0; self._sustain_threshold=0.9
         self._pulse_count_since_shape=0; self._shape_change_every=4
+        self._vis_max = 1e-9; self._overall_level = 0.0
         try:
             pygame.mixer.pre_init(frequency=self.sr,size=-16,channels=2,buffer=1024); pygame.mixer.init()
         except: pass
@@ -283,7 +293,7 @@ class Audio:
             try: pygame.mixer.music.load(self.path)
             except: pass
         except Exception as e:
-            print("Audio load error:",e); sys.exit(1)
+            print("Audio load error:",e); self.data=None; self.duration=0.0
     def _get_band_indices(self,bands,win):
         key=(bands,win,int(self.sr))
         if key in self._band_cache: return self._band_cache[key]
@@ -293,7 +303,8 @@ class Audio:
         slices=[(int(s),int(e)) for s,e in zip(starts,ends)]; self._band_cache[key]=slices; return slices
     def get_frequency_data(self,bands=64,fmin=20.0):
         if self.data is None or not self.playing:
-            self._energy_mean*=0.995; self._low_energy*=0.995; return np.zeros(bands)
+            self._energy_mean*=0.995; self._low_energy*=0.995; self._overall_level*=0.98
+            return np.zeros(bands)
         pos=int(self.t*self.sr); win=4096 if len(self.data)>16384 else 2048
         if pos+win>=len(self.data): return np.zeros(bands)
         window=self.data[pos:pos+win]*np.hanning(win); mag=np.abs(np.fft.rfft(window))
@@ -307,6 +318,13 @@ class Audio:
         maxv=levels.max()
         if maxv>0: levels/=(maxv+1e-12)
         levels=np.power(levels,0.9)
+        # overall visual level (smoothed)
+        try: raw_overall = float(np.mean(mag)) if mag.size else float(np.mean(levels)) if levels.size else 0.0
+        except: raw_overall = float(np.mean(levels)) if levels.size else 0.0
+        self._vis_max = max(self._vis_max * 0.995, raw_overall, 1e-9)
+        cur = raw_overall / (self._vis_max + 1e-12)
+        self._overall_level = 0.15 * cur + 0.85 * self._overall_level
+        # low-frequency bookkeeping (unchanged)
         now=time.time()
         try:
             low_bins=max(1,min(8,mag.size//8))
@@ -319,8 +337,7 @@ class Audio:
             self._last_pulse_time=now; self._pending_pulse=True; self._pulse_count_since_shape+=1
         return levels
     def pop_pulse(self):
-        if getattr(self,"_pending_pulse",False):
-            self._pending_pulse=False; return True
+        if getattr(self,"_pending_pulse",False): self._pending_pulse=False; return True
         return False
     def bass_sustained(self,rel_threshold=None):
         if rel_threshold is None: rel_threshold=self._sustain_threshold
@@ -350,6 +367,7 @@ class Audio:
             self.t=time.time()-self.start
             if self.t>=self.duration: self.playing=False
 
+# --- Main loop (tight)
 def main():
     dest=None; created_files=[]; created_folder=False
     if len(sys.argv)==2:
@@ -372,11 +390,28 @@ def main():
         except: pass
     atexit.register(_cleanup)
     fps=28.0; delay=1.0/fps; frame=0
+
+    # sensitivity tuning for speakers
+    SPEAKER_THRESHOLD = 0.28   # only above this does speaker move
+    SPEAKER_GAMMA = 2.2
+
     try:
         while True:
             t0=time.time(); audio.update_time()
             bands=min(128,max(24,disp.width-6))
             levels=audio.get_frequency_data(bands=bands)
+            # speaker: threshold + nonlinear mapping to reduce sensitivity
+            vol = getattr(audio, "_overall_level", 0.0)
+            if vol <= SPEAKER_THRESHOLD:
+                vol_adj = 0.0
+            else:
+                norm = (vol - SPEAKER_THRESHOLD) / (1.0 - SPEAKER_THRESHOLD)
+                vol_adj = max(0.0, min(1.0, norm)) ** SPEAKER_GAMMA
+            target = vol_adj * viz.speaker_level_multiplier
+            viz.speaker_target = (1.0 - viz.speaker_smooth) * viz.speaker_target + viz.speaker_smooth * target
+            if viz.speaker_scale < viz.speaker_target: viz.speaker_scale = viz.speaker_target
+            else: viz.speaker_scale = max(viz.speaker_target, viz.speaker_scale - viz.speaker_decay)
+
             now=time.time()
             if audio.pop_pulse():
                 viz.pulse_timer=viz.pulse_duration
@@ -401,6 +436,7 @@ def main():
                     while added<sustain_count and attempts<max_attempts:
                         if viz._add_star_at(random.randrange(0,viz.w), random.randrange(0,viz.h)): added+=1
                         attempts+=1
+
             rows,mask=viz.generate(list(levels) if isinstance(levels,np.ndarray) else list(levels))
             disp.update(rows,mask)
             if frame%4==0:
