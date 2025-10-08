@@ -4,7 +4,7 @@ SPIRAL — compact, faster terminal audio visualizer with side speakers driven b
 Requires: pip install numpy librosa pygame
 Controls: SPACE Play/Pause | R Reset | Q Quit
 """
-import sys, time, math, random, shutil, platform, atexit
+import sys, time, math, random, shutil, platform, atexit, re
 from pathlib import Path
 
 WINDOWS = platform.system() == "Windows"
@@ -42,10 +42,96 @@ def exe_parent_dir():
 # --- tiny helpers & palette
 def ansi_dim(c): return f"\x1b[2;38;5;{c}m"
 RESET = "\x1b[0m"
-PURPLE = [ansi_dim(c) for c in (129,135,141,147,141)]
-GREEN  = [ansi_dim(c) for c in (22,28,34,40,46)]
+# Centralized color palettes (256-color codes). Each palette is a list of ANSI color strings.
+PALETTES = {
+    "red":    [ansi_dim(c) for c in (196, 160, 124, 88, 52)],
+    "orange": [ansi_dim(c) for c in (208, 202, 166, 130, 94)],
+    "yellow": [ansi_dim(c) for c in (226, 220, 214, 184, 148)],
+    "green":  [ansi_dim(c) for c in (22, 28, 34, 40, 46)],
+    "blue":   [ansi_dim(c) for c in (19, 27, 33, 39, 45)],
+    "indigo": [ansi_dim(c) for c in (54, 55, 56, 57, 63)],
+    "violet": [ansi_dim(c) for c in (99, 105, 111, 127, 135)],
+    "purple": [ansi_dim(c) for c in (129, 135, 141, 147, 141)],
+}
 COLOR_SPEED = 0.45
 SUPPORTED = (".mp3", ".wav", ".ogg", ".flac")
+
+# Load active palette names from colors.txt (first line -> header, second line -> accent)
+def load_color_selection(fname="colors.txt"):
+    # Preference order for colors.txt (so users can ship an editable file next to the exe):
+    # 1) external file next to the executable (when frozen) or cwd
+    # 2) bundled resource in PyInstaller's _MEIPASS (if present)
+    # 3) project/source directory
+    default_header, default_accent = "purple", "green"
+    def parse_text(txt):
+        toks = [t.strip() for t in re.split('[,\n]+', txt) if t.strip() and not t.strip().startswith('#')]
+        if not toks:
+            return None
+        header = toks[0]
+        accent = toks[1] if len(toks) > 1 else default_accent
+        if header not in PALETTES: header = default_header
+        if accent not in PALETTES: accent = default_accent
+        return header, accent
+    try:
+        # 1) Check external next to the packaged EXE (works for both --onefile and --onedir):
+        if getattr(sys, 'frozen', False):
+            try:
+                argv0_dir = Path(sys.argv[0]).resolve().parent
+                p_ext = argv0_dir / fname
+                if p_ext.exists():
+                    parsed = parse_text(p_ext.read_text(encoding='utf-8'))
+                    if parsed: return parsed
+            except Exception:
+                pass
+            # fallback: also check sys.executable parent
+            try:
+                exe_dir = Path(sys.executable).resolve().parent
+                p_ext2 = exe_dir / fname
+                if p_ext2.exists():
+                    parsed = parse_text(p_ext2.read_text(encoding='utf-8'))
+                    if parsed: return parsed
+            except Exception:
+                pass
+            # also check one level up from the executable directory (useful when exe is inside a subfolder)
+            try:
+                exe_parent = Path(sys.executable).resolve().parent.parent
+                p_ext3 = exe_parent / fname
+                if p_ext3.exists():
+                    parsed = parse_text(p_ext3.read_text(encoding='utf-8'))
+                    if parsed: return parsed
+            except Exception:
+                pass
+        # 1b) also check current working directory (helpful for double-click runs)
+        p_cwd = Path.cwd() / fname
+        if p_cwd.exists():
+            parsed = parse_text(p_cwd.read_text(encoding='utf-8'))
+            if parsed: return parsed
+        # 2) If frozen with PyInstaller, check the bundled temp folder (_MEIPASS)
+        meipass = getattr(sys, '_MEIPASS', None)
+        if meipass:
+            p_mei = Path(meipass) / fname
+            if p_mei.exists():
+                parsed = parse_text(p_mei.read_text(encoding='utf-8'))
+                if parsed: return parsed
+        # 3) Fallback: project/source directory (normal dev run)
+        p_src = exe_parent_dir() / fname
+        if p_src.exists():
+            parsed = parse_text(p_src.read_text(encoding='utf-8'))
+            if parsed: return parsed
+        # Also check parent of the source/exe directory (handles colors.txt located alongside the parent folder)
+        try:
+            p_src_parent = exe_parent_dir().parent / fname
+            if p_src_parent.exists():
+                parsed = parse_text(p_src_parent.read_text(encoding='utf-8'))
+                if parsed: return parsed
+        except Exception:
+            pass
+    except Exception:
+        pass
+    return default_header, default_accent
+
+# active palette names chosen at startup (can be edited via colors.txt)
+ACTIVE_HEADER_NAME, ACTIVE_ACCENT_NAME = load_color_selection()
 
 def choose_and_copy(sub="input_audio"):
     base = exe_parent_dir(); folder = base / sub; created_folder = False
@@ -81,17 +167,24 @@ class Display:
         self.canvas = [" " * self.width for _ in range(self.height)]
         self.hide, self.show, self.clear = "\33[?25l", "\33[?25h", "\33[2J\33[H"
         print(self.hide + self.clear, end="", flush=True)
-        print(PURPLE[0] + "=" * self.term_width + RESET)
-        print(GREEN[2] + "SPIRAL".center(self.term_width) + RESET)
-        print(PURPLE[0] + "=" * self.term_width + RESET)
-        print(GREEN[1] + "Status: Ready | Controls: SPACE=Play R=Reset Q=Quit" + RESET + "\n", flush=True)
+        header_palette = PALETTES.get(ACTIVE_HEADER_NAME) or []
+        accent_palette = PALETTES.get(ACTIVE_ACCENT_NAME) or []
+        print((header_palette[0] if len(header_palette)>0 else "") + "=" * self.term_width + RESET)
+        print((accent_palette[2] if len(accent_palette)>2 else "") + "SPIRAL".center(self.term_width) + RESET)
+        print((header_palette[0] if len(header_palette)>0 else "") + "=" * self.term_width + RESET)
+        print((accent_palette[1] if len(accent_palette)>1 else "") + "Status: Ready | Controls: SPACE=Play R=Reset Q=Quit" + RESET + "\n", flush=True)
     def goto(self,x,y): return f"\33[{y+6};{x+2}H"
     def _colorize(self,row,mask,base):
-        out=[]; npal=len(PURPLE); gpal=len(GREEN)
+        out=[]; header_palette = PALETTES.get(ACTIVE_HEADER_NAME) or []
+        accent_palette = PALETTES.get(ACTIVE_ACCENT_NAME) or []
+        npal=len(header_palette); gpal=len(accent_palette)
         for i,ch in enumerate(row):
-            if ch==" ": out.append(" ")
-            elif mask and mask[i]=="1": out.append(GREEN[(base+(i//4))%gpal]+ch+RESET)
-            else: out.append(PURPLE[(base+(i//6))%npal]+ch+RESET)
+            if ch==" ":
+                out.append(" ")
+            elif mask and mask[i]=="1":
+                out.append(accent_palette[(base+(i//4))%gpal]+ch+RESET)
+            else:
+                out.append(header_palette[(base+(i//6))%npal]+ch+RESET)
         return "".join(out)
     def update(self, rows, masks=None):
         parts=[]; gw=self.goto; buf=self.canvas; base=int(time.time()*COLOR_SPEED)
@@ -104,8 +197,12 @@ class Display:
         if parts: print("".join(parts), end="", flush=True)
     def status(self,s,p=""):
         tw=self.term_width
-        print("\33[4;1H"+" "*(tw-1), end=""); print("\33[4;1H"+GREEN[2]+s[:tw-1]+RESET, end="", flush=True)
-        if p: print("\33[5;1H"+" "*(tw-1), end=""); print("\33[5;1H"+GREEN[1]+p[:tw-1]+RESET, end="", flush=True)
+        accent_palette = PALETTES.get(ACTIVE_ACCENT_NAME) or []
+        print("\33[4;1H"+" "*(tw-1), end="")
+        print("\33[4;1H"+(accent_palette[2] if len(accent_palette)>2 else "")+s[:tw-1]+RESET, end="", flush=True)
+        if p:
+            print("\33[5;1H"+" "*(tw-1), end="")
+            print("\33[5;1H"+(accent_palette[1] if len(accent_palette)>1 else "")+p[:tw-1]+RESET, end="", flush=True)
     def cleanup(self): print(self.show + self.clear, end="", flush=True)
 
 class Kbd:
