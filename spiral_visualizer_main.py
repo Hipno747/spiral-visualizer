@@ -6,6 +6,7 @@ Controls: SPACE Play/Pause | R Reset | Q Quit
 """
 import sys, time, math, random, shutil, platform, atexit, re
 from pathlib import Path
+import locale
 
 WINDOWS = platform.system() == "Windows"
 if WINDOWS:
@@ -26,6 +27,29 @@ try:
     TK_AVAILABLE = True
 except Exception:
     TK_AVAILABLE = False
+
+# choose a speaker glyph that is safe for the current stdout encoding
+def _choose_speaker_glyph():
+    glyph = "●"
+    enc = None
+    try:
+        enc = (sys.stdout.encoding or locale.getpreferredencoding(False) or "utf-8")
+        glyph.encode(enc)
+        return glyph
+    except Exception:
+        return "o"
+
+SAFE_SPEAKER_GLYPH = _choose_speaker_glyph()
+def _choose_block_glyphs():
+    full = "█"; empty = "░"
+    try:
+        enc = (sys.stdout.encoding or locale.getpreferredencoding(False) or "utf-8")
+        full.encode(enc); empty.encode(enc)
+        return full, empty
+    except Exception:
+        return "#", "-"
+
+SAFE_BLOCK_FULL, SAFE_BLOCK_EMPTY = _choose_block_glyphs()
 
 # --- resource-aware exe parent helper (replacement requested)
 def exe_parent_dir():
@@ -160,9 +184,12 @@ def choose_and_copy(sub="input_audio"):
 # --- Display + keyboard (small, efficient)
 class Display:
     def __init__(self):
-        tw, th = shutil.get_terminal_size(); self.term_width, self.term_height = tw, th
-        base_w = max(36, min(80, tw-6)); base_h = max(12, min(28, th-10))
-        w = min(tw-4, int(base_w*1.7)); h = min(th-8, int(base_h*1.4))
+        tw, th = shutil.get_terminal_size()
+        self.term_width, self.term_height = tw, th
+        # Allow the visualizer to grow with the terminal size while keeping margins for headers
+        base_w = max(36, tw-6); base_h = max(12, th-10)
+        w = min(tw-4, int(base_w * 1.7)); h = min(th-8, int(base_h * 1.4))
+        # clamp to a reasonable minimum but allow large sizes
         self.width, self.height = max(40, w), max(12, h)
         self.canvas = [" " * self.width for _ in range(self.height)]
         self.hide, self.show, self.clear = "\33[?25l", "\33[?25h", "\33[2J\33[H"
@@ -173,6 +200,28 @@ class Display:
         print((accent_palette[2] if len(accent_palette)>2 else "") + "SPIRAL".center(self.term_width) + RESET)
         print((header_palette[0] if len(header_palette)>0 else "") + "=" * self.term_width + RESET)
         print((accent_palette[1] if len(accent_palette)>1 else "") + "Status: Ready | Controls: SPACE=Play R=Reset Q=Quit" + RESET + "\n", flush=True)
+    def resize(self):
+        """Recompute sizes when the terminal is resized and force a full redraw."""
+        tw, th = shutil.get_terminal_size(); new_tw, new_th = tw, th
+        if new_tw == self.term_width and new_th == self.term_height:
+            return False
+        # update term dims
+        self.term_width, self.term_height = new_tw, new_th
+        # Allow base to grow with terminal size (no small upper cap)
+        base_w = max(36, new_tw-6); base_h = max(12, new_th-10)
+        w = min(new_tw-4, int(base_w*1.7)); h = min(new_th-8, int(base_h*1.4))
+        self.width, self.height = max(40, w), max(12, h)
+        # reset canvas to force redraw
+        self.canvas = [" " * self.width for _ in range(self.height)]
+        # clear and redraw headers
+        header_palette = PALETTES.get(ACTIVE_HEADER_NAME) or []
+        accent_palette = PALETTES.get(ACTIVE_ACCENT_NAME) or []
+        print(self.hide + self.clear, end="", flush=True)
+        print((header_palette[0] if len(header_palette)>0 else "") + "=" * self.term_width + RESET)
+        print((accent_palette[2] if len(accent_palette)>2 else "") + "SPIRAL".center(self.term_width) + RESET)
+        print((header_palette[0] if len(header_palette)>0 else "") + "=" * self.term_width + RESET)
+        print((accent_palette[1] if len(accent_palette)>1 else "") + "Status: Ready | Controls: SPACE=Play R=Reset Q=Quit" + RESET + "\n", flush=True)
+        return True
     def goto(self,x,y): return f"\33[{y+6};{x+2}H"
     def _colorize(self,row,mask,base):
         out=[]; header_palette = PALETTES.get(ACTIVE_HEADER_NAME) or []
@@ -244,7 +293,7 @@ class Visualizer:
         self.speaker_level_multiplier = 2.6
         self.speaker_decay = 0.06
         self.speaker_thickness = 2
-        self.speaker_glyph = "●"
+        self.speaker_glyph = SAFE_SPEAKER_GLYPH
     def blank(self): return [list(" "*self.w) for _ in range(self.h)], [list("0"*self.w) for _ in range(self.h)]
     def _set(self, rows,x,y,ch):
         if 0<=x<self.w and 0<=y<self.h: rows[y][x]=ch
@@ -324,18 +373,48 @@ class Visualizer:
             elif name=="rings": self._rings(rows,cx,self.cy,scale,levels)
             else: self._waves(rows,cx,self.cy,scale,levels)
     def add_spectrum(self,rows,mask,levels,bar_slots=None):
-        if bar_slots is None: bar_slots=min(self.w-6,len(levels))
-        if bar_slots<=0: return
+        # Stretch the spectrum to span the full visual width (touching sides)
+        if bar_slots is None:
+            bar_slots = self.w
+        if bar_slots<=0:
+            return
         L=np.asarray(levels,dtype=float)
-        if self.prev_levels is None or self.prev_levels.shape!=L.shape: self.prev_levels=L.copy()
+        if self.prev_levels is None or self.prev_levels.shape!=L.shape:
+            self.prev_levels=L.copy()
         a=self.smooth_alpha; smooth=a*L+(1-a)*self.prev_levels; self.prev_levels=smooth
         src=np.linspace(0.0,smooth.size-1.0,smooth.size); tgt=np.linspace(0.0,smooth.size-1.0,bar_slots)
         mapped=np.interp(tgt,src,smooth)
-        maxh=self.h-3; chars=self.SPECTRUM; clen=len(chars); base_x=3
+        maxh=max(1,self.h-3); chars=self.SPECTRUM; clen=len(chars); base_x=0
         for i,v in enumerate(mapped):
             bar_h=int(v*maxh); x=base_x+i
             for j in range(bar_h):
-                y=self.h-2-j; ch=chars[min(j*clen//max(1,maxh),clen-1)]; self._set_spec(rows,mask,x,y,ch)
+                y=self.h-1-j; ch=chars[min(j*clen//max(1,maxh),clen-1)]; self._set_spec(rows,mask,x,y,ch)
+
+    def resize(self, new_w, new_h):
+        """Adjust internal size and remap particle coordinates so they span the new canvas.
+        Particles keep the same visual size but their positions scale to the new dimensions.
+        Returns True if size changed.
+        """
+        old_w, old_h = self.w, self.h
+        if old_w == new_w and old_h == new_h:
+            return False
+        # Remap star positions proportionally
+        new_stars = {}
+        for (x,y), life in list(self.star_lives.items()):
+            try:
+                nx = int(round(x * (new_w/old_w))) if old_w>0 else x
+                ny = int(round(y * (new_h/old_h))) if old_h>0 else y
+            except Exception:
+                nx, ny = x, y
+            nx = max(0, min(new_w-1, nx))
+            ny = max(0, min(new_h-1, ny))
+            new_stars[(nx,ny)] = life
+        self.star_lives = new_stars
+        # update dimensions and center
+        self.w, self.h = new_w, new_h
+        self.cx, self.cy = new_w//2, new_h//2
+        # keep speaker sizing and other params recomputed at draw time (they use self.w/self.h)
+        return True
     def _add_star_at(self,x,y):
         if 0<=x<self.w and 0<=y<self.h and (x,y) not in self.star_lives:
             self.star_lives[(x,y)]=self.star_fade_frames; return True
@@ -495,7 +574,10 @@ def main():
     try:
         while True:
             t0=time.time(); audio.update_time()
-            bands=min(128,max(24,disp.width-6))
+            # check for terminal resize and propagate before generating visuals
+            if disp.resize():
+                viz.resize(disp.width, disp.height)
+            bands=min(512,max(24,disp.width-6))
             levels=audio.get_frequency_data(bands=bands)
             # speaker: threshold + nonlinear mapping to reduce sensitivity
             vol = getattr(audio, "_overall_level", 0.0)
@@ -540,7 +622,7 @@ def main():
                 status=f"Status: {'PLAYING' if audio.playing else 'PAUSED'} | Shape: {Visualizer.SHAPES[viz.shape_idx].upper()}"
                 if audio.duration>0:
                     p=min(1.0,audio.t/audio.duration); bl=38; filled=int(bl*p)
-                    prog="█"*filled+"░"*(bl-filled); disp.status(status,f"[{prog}]")
+                    prog=SAFE_BLOCK_FULL*filled+SAFE_BLOCK_EMPTY*(bl-filled); disp.status(status,f"[{prog}]")
                 else: disp.status(status,"")
             k=kbd.get()
             if k:
